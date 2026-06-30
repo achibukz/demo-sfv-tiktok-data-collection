@@ -176,6 +176,7 @@ submissions
   contact_email            text
   consent_version          text              -- "v1.0"
   consent_hash             text              -- sha256 of consent markdown at accept time
+  consent_signature_name   text              -- full name typed at consent step
   consent_accepted_at      timestamptz
   submitted_at             timestamptz
   superseded_at            timestamptz NULL
@@ -263,11 +264,21 @@ GET  /confirmed/:id             receipt page
 
 ### Consent
 
-Renders `consent/v1.0.md` (or the current version). Checkbox + Continue button. On accept, the server action:
+The participant must complete the consent step before the submission form is reachable. The page renders `consent/v1.0.md` (or the current version) as the body of the ICF. Below the body:
+
+- **Full name** (text input, required, trimmed, non-empty) — typed signature
+- **Checkbox**, required: "I have read the above and consent to participating in this research."
+- **Continue** button (disabled until both name is filled and checkbox is ticked)
+
+`consent/v1.0.md` body content is **TBD** — researchers will supply the detailed informed-consent text. Until then, the file is a single placeholder line; the bytes still get hashed so the version pin is real.
+
+On accept, the server action:
 - Reads consent markdown from disk, computes sha256
-- Stashes `{ consent_version, consent_hash, consent_accepted_at }` in the session cookie (no draft DB row)
-- Logs `consent.accepted`
+- Stashes `{ consent_version, consent_hash, consent_signature_name, consent_accepted_at }` in the session cookie (no draft DB row)
+- Logs `consent.accepted` with `{ consent_version, consent_hash }` in metadata (the typed name is **not** put in `audit_log.metadata` — it lives on the submission row only)
 - Redirects to `/submit`
+
+If the participant reaches `/submit` without a valid consent payload in the cookie, they get redirected back to `/consent`.
 
 ### Submit form
 
@@ -278,11 +289,11 @@ Fields:
 - Follower history CSV (file input, required, `.csv` accept)
 
 Server action on submit, single transaction:
-1. Re-check session cookie + consent fields
+1. Re-check session cookie carries `{ invite_id, consent_version, consent_hash, consent_signature_name, consent_accepted_at }`; redirect to `/consent` if any are missing
 2. Validate both CSVs (see Validation section)
 3. Any failure → re-render form with per-field errors, log `csv.rejected`, save nothing
 4. Find prior current submission for this `invite_id`; mark `superseded_at`, NULL its `csv_files.bytes`
-5. Insert new `submissions` row
+5. Insert new `submissions` row, including `consent_signature_name` from the cookie
 6. Insert two `csv_files` rows (with bytes, sha256, row_count, size)
 7. Update `invites.last_used_at`
 8. Log `submission.created` + two `csv.validated`
@@ -290,7 +301,7 @@ Server action on submit, single transaction:
 
 ### Confirmation page
 
-Shows submission UUID (full + short prefix), handle, ISO date, two filenames + row counts. Guidance: "You can resubmit any time with the same access code; the latest version will replace this one." + "To withdraw, email <research-contact>."
+Shows submission UUID (full + short prefix), handle, ISO date, signed name, two filenames + row counts. Guidance: "You can resubmit any time with the same access code; the latest version will replace this one." + "To withdraw, email <research-contact>."
 
 Session stays alive until cookie idles out — participant can hit `/submit` again from `/confirmed/:id` without re-entering the code.
 
@@ -333,7 +344,7 @@ Default filter: `superseded_at IS NULL AND withdrawn_at IS NULL`. Toggles to inc
 
 ### Submission detail
 
-Metadata + consent version/hash + accepted_at + per-file panels (filename, size, sha256, row_count, "Download CSV") + audit timeline scoped to this `target_id`.
+Metadata + consent panel (`consent_version`, `consent_hash`, `consent_signature_name`, `consent_accepted_at`) + per-file panels (filename, size, sha256, row_count, "Download CSV") + audit timeline scoped to this `target_id`.
 
 Actions:
 - **Withdraw** — modal asks reason; sets `withdrawn_at`, `withdrawn_by`, `withdrawn_reason`, NULLs `csv_files.bytes`. Logs `submission.withdrawn`.
@@ -351,6 +362,17 @@ submission_<shortid>_<handle>/
   ├─ consent_<version>.txt
   └─ audit.json
 ```
+
+`consent_<version>.txt` is the exact bytes of the ICF the participant accepted, followed by a signature block appended at export time:
+
+```
+--- SIGNATURE ---
+Signed by: <consent_signature_name>
+Accepted at: <consent_accepted_at, ISO 8601 UTC>
+Document hash (sha256): <consent_hash>
+```
+
+`submission.json` includes `consent_signature_name`, `consent_accepted_at`, `consent_version`, and `consent_hash` as top-level fields.
 
 ### Bulk zip
 
@@ -516,7 +538,10 @@ Plus generated mutants for negative cases.
 Server actions against a real DB, no HTTP:
 - `enterCode` invalid → counter bumps, no session
 - `enterCode` valid → session set, log row written
-- `submitForm` first submission → row + 2 csv_files inserted, `invites.last_used_at` updated
+- `acceptConsent` with empty name → rejected, session unchanged
+- `acceptConsent` with name + checkbox → session carries `consent_signature_name`, log row written
+- `submitForm` without consent in session → redirect to `/consent`, nothing inserted
+- `submitForm` first submission → row + 2 csv_files inserted, `consent_signature_name` persisted, `invites.last_used_at` updated
 - `submitForm` second submission → prior superseded, prior bytes NULLed, prior metadata kept
 - `submitForm` validation failure → nothing inserted, both errors returned
 - `issueInvite` → row inserted, mock mailer called once with the code
@@ -530,8 +555,8 @@ Postgres container per suite; migrations run before each suite; no shared fixtur
 Against a locally-running app + DB:
 1. Seed an invite via SQL
 2. Browser opens `/`, enters the code, accepts consent, uploads both fixture CSVs, sees confirmation
-3. Browser opens `/admin` (admin session pre-set), sees the submission, downloads the per-submission zip
-4. Assert the zip contains both CSVs + `submission.json` + `consent_*.txt` + `audit.json`
+3. Browser opens `/admin` (admin session pre-set), sees the submission with the typed signature, downloads the per-submission zip
+4. Assert the zip contains both CSVs + `submission.json` (with `consent_signature_name`) + `consent_*.txt` (with the appended SIGNATURE block) + `audit.json`
 
 ### Out of scope for testing
 
@@ -545,13 +570,17 @@ GitHub Actions: lint → typecheck → unit + integration → smoke. Postgres se
 
 ## Open dependencies
 
-These must be resolved with ALTDSI sysadmin before the site goes live with real participants:
+These must be resolved before the site goes live with real participants:
 
+**ALTDSI sysadmin**
 1. **OIDC identity provider** — Google Workspace, ALTDSI custom OIDC, or local accounts behind VPN. Provider URL + client ID/secret needed.
 2. **Outbound SMTP** — DLSU/ALTDSI relay credentials, or approved third-party (Postmark/Resend) sender domain with SPF/DKIM.
-3. **Domain + TLS** — final hostname for the magic-link emails and admin OIDC callback URL.
+3. **Domain + TLS** — final hostname for invite emails and admin OIDC callback URL.
 
-Spec uses sensible defaults for each; implementation lands as env-configurable so the deploy step doesn't require a code change.
+**Research team**
+4. **Informed-consent body text** — `consent/v1.0.md` body content is TBD. The site renders whatever bytes are in that file and hashes them per-submission, so the file can land any time before recruitment starts.
+
+Spec uses sensible defaults for sysadmin items; implementation lands as env-configurable so the deploy step doesn't require a code change.
 
 ## Future work (not in MVP)
 

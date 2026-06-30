@@ -95,7 +95,7 @@ Releases: manual (`git pull`, `pnpm install`, `pnpm build`, `systemctl restart s
 ## Project layout
 
 ```
-sfv-tiktok-data-collection/
+demo-sfv-tiktok-data-collection/
 ├── app/
 │   ├── (participant)/
 │   │   ├── page.tsx              # landing + code entry
